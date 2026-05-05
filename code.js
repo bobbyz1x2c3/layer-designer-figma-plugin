@@ -89,9 +89,12 @@ function base64ToUint8Array(base64) {
 async function createLayerNode(layer, images) {
   const rect = figma.createRectangle();
   rect.name = layer.name || layer.id || 'Layer';
-  rect.x = layer.layout.x;
-  rect.y = layer.layout.y;
-  rect.resize(layer.layout.width, layer.layout.height);
+
+  // Defensive: handle missing layout gracefully
+  const layout = layer.layout || { x: 0, y: 0, width: 100, height: 100 };
+  rect.x = layout.x || 0;
+  rect.y = layout.y || 0;
+  rect.resize(layout.width || 100, layout.height || 100);
   rect.opacity = layer.opacity !== undefined ? layer.opacity : 1;
   if (layer.id) {
     rect.setPluginData('layerId', layer.id);
@@ -207,7 +210,20 @@ async function createRepeatAutoLayout(parentFrame, group, images) {
 
   const config = parentLayer.repeat_config || {};
   const mode = parentLayer.repeat_mode || 'list';
-  const padding = resolvePadding(config);
+  const rawPadding = resolvePadding(config);
+  // Figma auto-layout does not accept negative padding; we clamp the values
+  // fed to auto-layout and compensate by expanding the autoFrame so cells
+  // can spill outside the container when the detected padding is negative.
+  const padding = {
+    top: Math.max(0, rawPadding.top),
+    right: Math.max(0, rawPadding.right),
+    bottom: Math.max(0, rawPadding.bottom),
+    left: Math.max(0, rawPadding.left)
+  };
+  const spillLeft = Math.max(0, -rawPadding.left);
+  const spillRight = Math.max(0, -rawPadding.right);
+  const spillTop = Math.max(0, -rawPadding.top);
+  const spillBottom = Math.max(0, -rawPadding.bottom);
 
   // Create container frame
   const container = figma.createFrame();
@@ -227,31 +243,13 @@ async function createRepeatAutoLayout(parentFrame, group, images) {
   container.setPluginData('parentLayerLayout', JSON.stringify({ x: 0, y: 0, width: cellW, height: cellH }));
   container.setPluginData('parentLayerOpacity', String(parentLayer.opacity !== undefined ? parentLayer.opacity : 1));
 
-  // On round-trip, parentLayer.layout becomes container bounds (with cell_layout holding cell size).
-  // On first import, parentLayout.layout is cell size, so fall back to panel/instance coords.
-  const baseX = parentLayer.cell_layout ? parentLayer.layout.x : (panel ? panel.layout.x : instances[0].layout.x);
-  const baseY = parentLayer.cell_layout ? parentLayer.layout.y : (panel ? panel.layout.y : instances[0].layout.y);
-  container.x = baseX;
-  container.y = baseY;
-
-  let containerW, containerH;
-  if (parentLayer.cell_layout) {
-    // Round-trip: use saved container bounds directly, don't recompute
-    containerW = parentLayer.layout.width;
-    containerH = parentLayer.layout.height;
-  } else if (panel) {
-    containerW = panel.layout.width;
-    containerH = panel.layout.height;
-  } else {
-    // First import: compute from instance absolute coordinates
-    let maxRight = 0, maxBottom = 0;
-    for (const inst of instances) {
-      maxRight = Math.max(maxRight, inst.layout.x + inst.layout.width - baseX);
-      maxBottom = Math.max(maxBottom, inst.layout.y + inst.layout.height - baseY);
-    }
-    containerW = (maxRight || instances[0].layout.width) + padding.left + padding.right;
-    containerH = (maxBottom || instances[0].layout.height) + padding.top + padding.bottom;
-  }
+  // Use area_layout as the container bounds so the detected padding is
+  // measured against the planned container, not the first cell.
+  const areaLayout = config.area_layout || parentLayer.layout || {};
+  container.x = areaLayout.x || 0;
+  container.y = areaLayout.y || 0;
+  const containerW = areaLayout.width || 100;
+  const containerH = areaLayout.height || 100;
   container.resize(containerW, containerH);
   container.fills = [];
   container.clipsContent = false;
@@ -262,8 +260,10 @@ async function createRepeatAutoLayout(parentFrame, group, images) {
     panelNode.setPluginData('isRepeatPanel', 'true');
     panelNode.setPluginData('repeatParentId', pid);
     container.appendChild(panelNode);
-    panelNode.x = 0;
-    panelNode.y = 0;
+    // Position panel relative to container so its absolute coords match
+    // the detected bbox from enhanced_layer_plan.
+    panelNode.x = (panel.layout.x || 0) - (areaLayout.x || 0);
+    panelNode.y = (panel.layout.y || 0) - (areaLayout.y || 0);
     panelNode.resize(panel.layout.width, panel.layout.height);
   }
 
@@ -441,8 +441,11 @@ async function createRepeatAutoLayout(parentFrame, group, images) {
   }
 
   container.appendChild(autoFrame);
-  autoFrame.x = 0;
-  autoFrame.y = 0;
+  // When padding is negative the cells spill outside the container.
+  // Shift the autoFrame so the spill is visible and the layout matches
+  // the detected coordinates.
+  autoFrame.x = -spillLeft;
+  autoFrame.y = -spillTop;
   parentFrame.appendChild(container);
 }
 
@@ -452,18 +455,20 @@ async function createRepeatAutoLayout(parentFrame, group, images) {
  * @param {Record<string, Uint8Array>} images - Map of image name -> PNG bytes
  */
 async function importLayers(plan, images) {
-  console.log('[LayerImporter] importLayers start, dimensions:', plan.dimensions);
+  // Defensive: validate plan structure
+  const dimensions = plan.dimensions || { width: 1024, height: 1024 };
+  console.log('[LayerImporter] importLayers start, dimensions:', dimensions);
 
   // Create the main frame, centered on current viewport
   const frame = figma.createFrame();
   frame.name = plan.project || "Imported Design";
-  frame.resize(plan.dimensions.width, plan.dimensions.height);
+  frame.resize(dimensions.width || 1024, dimensions.height || 1024);
   frame.fills = [{ type: 'SOLID', color: { r: 0.05, g: 0.05, b: 0.05 } }];
   frame.clipsContent = false;
 
   const center = figma.viewport.center;
-  frame.x = center.x - plan.dimensions.width / 2;
-  frame.y = center.y - plan.dimensions.height / 2;
+  frame.x = center.x - (dimensions.width || 1024) / 2;
+  frame.y = center.y - (dimensions.height || 1024) / 2;
 
   // Build a lookup map from layer id/name -> layer data
   // Falls back to source basename if id is missing
@@ -485,12 +490,19 @@ async function importLayers(plan, images) {
   console.log('[LayerImporter] images keys:', Object.keys(images));
 
   // Sort layers by stacking_order
-  const sortedIds = plan.stacking_order || plan.layers.map(l => l.id).filter(Boolean);
-  const sortedLayers = sortedIds
+  const allLayers = plan.layers || [];
+  const sortedIds = plan.stacking_order || allLayers.map(l => l.id).filter(Boolean);
+  let sortedLayers = sortedIds
     .map(id => layerMap.get(id))
     .filter(l => l !== undefined);
 
-  console.log('[LayerImporter] sortedLayers:', sortedLayers.length, 'of', plan.layers.length);
+  // If stacking_order is empty or invalid, fall back to original layer order
+  if (sortedLayers.length === 0 && allLayers.length > 0) {
+    console.warn('[LayerImporter] stacking_order invalid, falling back to layer order');
+    sortedLayers = [...allLayers];
+  }
+
+  console.log('[LayerImporter] sortedLayers:', sortedLayers.length, 'of', allLayers.length);
 
   // Pre-process repeat groups from all layers (including parents not in stacking_order)
   const repeatGroups = {};
@@ -886,7 +898,7 @@ function findImageForLayer(id, name, images, source) {
     .replace(/_v\d+$/, '');
 
   // 0. Source-based match (highest priority)
-  if (source) {
+  if (source && typeof source === 'string') {
     const sourceBase = source.split('/').pop().replace(/\.png$/i, '');
 
     // 0a. Exact source basename match
